@@ -1,91 +1,238 @@
-import telebot
-import threading
-import time
-import uuid
-import json
-import os
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from keep_alive import keep_alive  # To keep server alive 24/7
+import sqlite3
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler, 
+    MessageHandler, ContextTypes, ConversationHandler, filters
+)
 
-API_TOKEN = '8794394167:AAHTK4F7wJogBBjEcUR_bf8-NHy4Pxvz19Y'
+# --- CONFIGURATION ---
+BOT_TOKEN = "8794394167:AAHTK4F7wJogBBjEcUR_bf8-NHy4Pxvz19Y" 
 ADMIN_ID = 5687910029
-CHANNEL_LINK = 'https://t.me/+5v-jy2esoPdmYTA9'
-BOT_USERNAME = 'AMIT_DUBBERS_bot'
+BOT_USERNAME = "AMIT_DUBBERS_bot" 
+CHANNEL_LINK = "https://t.me/+5v-jy2esoPdmYTA9" 
 
-bot = telebot.TeleBot(API_TOKEN)
-DB_FILE = "videos_database.json"
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_db(data):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-video_database = load_db()
-
-def auto_delete_and_notify(chat_id, message_id, delay=600):
-    time.sleep(delay)
-    try:
-        bot.delete_message(chat_id, message_id)
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK))
-        bot.send_message(
-            chat_id,
-            "⏳ Time is up! The video has been deleted. Join our channel for more videos:",
-            reply_markup=markup
+# --- DATABASE SETUP ---
+def init_db():
+    conn = sqlite3.connect("anime_bot.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS anime (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            name TEXT UNIQUE
         )
-    except Exception as e:
-        print(f"Error: {e}")
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            anime_id INTEGER, 
+            file_id TEXT, 
+            caption TEXT,
+            FOREIGN KEY (anime_id) REFERENCES anime (id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    args = message.text.split()
-    if len(args) > 1:
-        vid_key = args[1]
-        if vid_key in video_database:
-            video_data = video_database[vid_key]
-            
-            # Support for old database structure (if stored as string file_id)
-            if isinstance(video_data, dict):
-                file_id = video_data.get("file_id")
-                caption_text = video_data.get("caption", "")
-            else:
-                file_id = video_data
-                caption_text = ""
+init_db()
 
-            bot.send_message(message.chat.id, "⚠️ Note: This video will be deleted in 10 minutes.")
-            
-            # Sending video with original caption/title
-            sent = bot.send_video(message.chat.id, file_id, caption=caption_text)
-            threading.Thread(target=auto_delete_and_notify, args=(message.chat.id, sent.message_id, 600)).start()
-        else:
-            bot.send_message(message.chat.id, "❌ Invalid link.")
-    else:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("📢 Go to Channel", url=CHANNEL_LINK))
-        bot.send_message(message.chat.id, "Visit our channel for videos:", reply_markup=markup)
+# --- START COMMAND ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        payload = context.args[0] 
+        if payload.startswith("anime_"):
+            anime_id = payload.split("_")[1]
+            await send_anime_videos(update, anime_id)
+            return
+        elif payload.startswith("vid_"):
+            video_file_id = payload.replace("vid_", "")
+            await update.message.reply_video(video=video_file_id)
+            return
 
-@bot.message_handler(content_types=['video'])
-def upload(message):
-    if message.from_user.id != ADMIN_ID:
+    user = update.effective_user
+    keyboard = [
+        [InlineKeyboardButton("📢 Join My Channel", url=CHANNEL_LINK)],
+        [InlineKeyboardButton("🎬 Free Anime", callback_data="show_anime_list")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"Namaste {user.first_name}! Main aapka Anime Bot hoon.\nNiche diye gaye options me se select karein:",
+        reply_markup=reply_markup
+    )
+
+async def send_anime_videos(update: Update, anime_id: str):
+    conn = sqlite3.connect("anime_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_id, caption FROM videos WHERE anime_id = ?", (anime_id,))
+    videos = cursor.fetchall()
+    conn.close()
+
+    if not videos:
+        await update.effective_message.reply_text("❌ Is Anime folder me abhi koi video nahi hai.")
         return
-    vid_id = uuid.uuid4().hex[:8]
-    
-    # Save video file_id and caption
-    video_database[vid_id] = {
-        "file_id": message.video.file_id,
-        "caption": message.caption if message.caption else ""
-    }
-    save_db(video_database)
-    
-    link = f"https://t.me/{BOT_USERNAME}?start={vid_id}"
-    bot.reply_to(message, f"✅ Saved successfully!\n\nID: `{vid_id}`\nLink: `{link}`", parse_mode="Markdown")
 
-keep_alive()  # To keep bot running
-bot.infinity_polling()
+    await update.effective_message.reply_text("📽️ Videos bhej raha hoon, kripya wait karein...")
+    for file_id, caption in videos:
+        await update.effective_message.reply_video(
+            video=file_id,
+            caption=caption or ""
+        )
+
+# --- BUTTON HANDLER ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "show_anime_list":
+        conn = sqlite3.connect("anime_bot.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name FROM anime")
+        anime_list = cursor.fetchall()
+        conn.close()
+
+        if not anime_list:
+            await query.edit_message_text("Abhi koi Anime available nahi hai. Admin jald hi add karenge!")
+            return
+
+        keyboard = []
+        for a_id, a_name in anime_list:
+            deep_link = f"https://t.me/{BOT_USERNAME}?start=anime_{a_id}"
+            keyboard.append([InlineKeyboardButton(f"📁 {a_name}", url=deep_link)])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")])
+        
+        await query.edit_message_text(
+            "Niche se apna favorite Anime select karein:", 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif query.data == "main_menu":
+        keyboard = [
+            [InlineKeyboardButton("📢 Join My Channel", url=CHANNEL_LINK)],
+            [InlineKeyboardButton("🎬 Free Anime", callback_data="show_anime_list")]
+        ]
+        await query.edit_message_text("Main Menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# --- NORMAL VIDEO HANDLER FOR ADMIN (Bina /addanime ke video bhejne par) ---
+async def handle_normal_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    video = update.message.video or update.message.document
+    file_id = video.file_id
+
+    share_link = f"https://t.me/{BOT_USERNAME}?start=vid_{file_id}"
+    
+    msg = (
+        "✅ **Single Video Received!**\n\n"
+        f"🆔 **File ID:** `{file_id}`\n\n"
+        f"🔗 **Direct Share Link:**\n`{share_link}`\n\n"
+        f"👉 **Masked Link:**\n<a href='{share_link}'>▶️ CLICK HERE TO WATCH VIDEO</a>"
+    )
+
+    keyboard = [[InlineKeyboardButton("🚀 Open Video", url=share_link)]]
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
+
+# --- FOLDER ADD CONVERSATION (/addanime) ---
+WAITING_NAME, WAITING_VID = 1, 2
+
+async def add_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Ye command sirf Admin ke liye hai!")
+        return ConversationHandler.END
+
+    await update.message.reply_text("Kripya Anime/Folder ka naam batayein (jaise: Naruto):")
+    return WAITING_NAME
+
+async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    anime_name = update.message.text.strip()
+    
+    conn = sqlite3.connect("anime_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO anime (name) VALUES (?)", (anime_name,))
+    conn.commit()
+    
+    cursor.execute("SELECT id FROM anime WHERE name = ?", (anime_name,))
+    a_id = cursor.fetchone()[0]
+    conn.close()
+
+    context.user_data['a_id'] = a_id
+    context.user_data['a_name'] = anime_name
+
+    await update.message.reply_text(
+        f"✅ Folder Ban Gaya: *{anime_name}*\n\n"
+        "Ab is folder me jitni bhi videos bhejna chahte hain, bhejte rahein.\n"
+        "Finish karne ke liye `/done` likhein.",
+        parse_mode="Markdown"
+    )
+    return WAITING_VID
+
+async def receive_vid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a_id = context.user_data.get('a_id')
+    video = update.message.video or update.message.document
+    file_id = video.file_id
+    caption = update.message.caption or ""
+
+    conn = sqlite3.connect("anime_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO videos (anime_id, file_id, caption) VALUES (?, ?, ?)", (a_id, file_id, caption))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("✅ Video folder me save ho gayi! Aur videos bhejein ya `/done` likhein.")
+    return WAITING_VID
+
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a_id = context.user_data.get('a_id')
+    a_name = context.user_data.get('a_name', 'Anime')
+    
+    share_link = f"https://t.me/{BOT_USERNAME}?start=anime_{a_id}"
+    
+    message = (
+        f"🎉 **{a_name}** Folder Ready Ho Gaya!\n\n"
+        f"🔗 **Normal Link:**\n`{share_link}`\n\n"
+        f"👉 **Masked Link:**\n<a href='{share_link}'>▶️ WATCH {a_name}</a>"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🚀 Start Bot Directly", url=share_link)]]
+    await update.message.reply_text(message, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Process cancel ho gaya.")
+    return ConversationHandler.END
+
+# --- MAIN ---
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("addanime", add_anime)],
+        states={
+            WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
+            WAITING_VID: [
+                MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_vid),
+                CommandHandler("done", done)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_normal_video))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("Bot Running...")
+    app.run_polling()
+
 
 
